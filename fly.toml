@@ -1,0 +1,99 @@
+# ==================== fly.toml ====================
+# Fly.io Configuration للبوت
+
+app = "your-discord-bot-name"  # غيّر هذا لاسم البوت
+
+[build]
+  [build.env]
+    PYTHON_VERSION = "3.11"
+
+[deploy]
+  strategy = "immediate"
+
+# Environment Variables (استخدم fly secrets لإضافة DISCORD_TOKEN)
+# fly secrets set DISCORD_TOKEN=your_token_here
+# fly secrets set GUILD_ID=your_guild_id (اختياري)
+
+[env]
+  # يمكنك إضافة متغيرات عامة هنا
+  LOG_LEVEL = "INFO"
+
+# ==================== Procfile ====================
+# (حفظ في ملف منفصل اسمه Procfile بدون امتداد)
+# worker: python main.py
+
+# ==================== runtime.txt ====================
+# (حفظ في ملف منفصل اسمه runtime.txt)
+# python-3.11
+
+# ==================== .dockerignore ====================
+# (حفظ في ملف منفصل اسمه .dockerignore)
+# __pycache__/
+# *.pyc
+# *.pyo
+# *.pyd
+# .env
+# database.db
+# .vscode/
+# *.log
+# .DS_Store
+# .pythonlibs/
+# .local/
+# *.db
+# .git/
+# .gitignore
+# README.md
+# QUICKSTART.md
+# replit.md
+# keep_alive.py
+# ticket_manager.py
+# events_guildMemberAdd.py
+# db.json
+
+# ==================== تعليمات النشر ====================
+# 
+# 1. تثبيت Fly CLI:
+#    curl -L https://fly.io/install.sh | sh
+#
+# 2. تسجيل الدخول:
+#    fly auth login
+#
+# 3. إنشاء التطبيق:
+#    fly launch
+#    (سيتم إنشاء fly.toml تلقائياً - استبدله بهذا الملف)
+#
+# 4. إضافة Secrets:
+#    fly secrets set DISCORD_TOKEN="your_actual_token_here"
+#    fly secrets set GUILD_ID="your_guild_id" (اختياري)
+#
+# 5. النشر:
+#    fly deploy
+#
+# 6. مراقبة الـ Logs:
+#    fly logs
+#
+# 7. إيقاف/تشغيل:
+#    fly scale count 0  # إيقاف
+#    fly scale count 1  # تشغيل
+#
+# ==================== ملاحظات مهمة ====================
+#
+# - البوت لا يحتاج HTTP server على Fly.io
+# - keep_alive.py غير ضروري (احذفه)
+# - database.db سيُحفظ في Fly Volume (اختياري)
+# - Logs تُحفظ تلقائياً في Fly
+#
+# ==================== إضافة Volume للـ Database (اختياري) ====================
+#
+# إذا أردت حفظ database.db بين عمليات النشر:
+#
+# 1. إنشاء volume:
+#    fly volumes create discord_bot_data --size 1
+#
+# 2. إضافة في fly.toml:
+#    [mounts]
+#      source = "discord_bot_data"
+#      destination = "/data"
+#
+# 3. تعديل database.py:
+#    DB_PATH = '/data/database.db'
