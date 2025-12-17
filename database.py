@@ -731,4 +731,3 @@ class Database:
 
 # إنشاء نسخة عامة
 db = Database()
-```0
