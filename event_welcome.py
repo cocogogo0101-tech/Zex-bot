@@ -1,8 +1,9 @@
-# ==================== event_welcome.py - UPDATED ====================
+# ==================== event_welcome.py - IMPROVED ====================
 """
 أحداث الترحيب والوداع
 ✅ تم إضافة نظام تتبع الدعوات
 ✅ إظهار من دعا العضو في الترحيب
+✅ دعم متغير {inviter} قابل للتخصيص
 ✅ Guards شاملة
 """
 import discord
@@ -23,15 +24,19 @@ async def handle_member_join(member: discord.Member):
         
         # ==================== تتبع الدعوات ====================
         inviter = None
+        inviter_name = "غير معروف"
+        invite_count = 0
+        
         try:
             # محاولة اكتشاف من دعا العضو
             inviter = await invite_tracker.find_inviter(member)
             
             if inviter:
-                # حفظ في قاعدة البيانات تم بالفعل في find_inviter
+                # جلب عدد الدعوات
+                invite_count = await invite_tracker.get_user_invites(guild_id, str(inviter.id))
+                inviter_name = inviter.mention  # أو inviter.name حسب التفضيل
                 
                 # التحقق من المكافآت
-                invite_count = await invite_tracker.get_user_invites(guild_id, str(inviter.id))
                 await invite_rewards.check_rewards(
                     member.guild,
                     inviter,
@@ -42,8 +47,14 @@ async def handle_member_join(member: discord.Member):
                     f'{member.name} انضم إلى {member.guild.name} '
                     f'بدعوة من {inviter.name} (إجمالي: {invite_count})'
                 )
+            else:
+                # لم يتم العثور على الداعي
+                inviter_name = "رابط دعوة خاص"
+                bot_logger.info(f'{member.name} انضم عبر رابط خاص أو Vanity URL')
+        
         except Exception as e:
             bot_logger.error(f'خطأ في تتبع الدعوة: {e}')
+            inviter_name = "غير متاح"
             # نكمل حتى لو فشل تتبع الدعوات
         
         # ==================== رسالة الترحيب ====================
@@ -73,31 +84,34 @@ async def handle_member_join(member: discord.Member):
                 # Embed مع معلومات الدعوة
                 embed = embeds.welcome_embed(member, member.guild.member_count)
                 
-                # إضافة معلومات الدعوة
-                if inviter:
-                    invite_count = await invite_tracker.get_user_invites(guild_id, str(inviter.id))
+                # إضافة معلومات الدعوة (اختياري - فقط إذا كانت مفعلة)
+                if settings.get('show_inviter', True) and inviter:
                     embed.add_field(
                         name='📨 تمت الدعوة بواسطة',
                         value=f'{inviter.mention} • **{invite_count}** دعوات',
                         inline=False
                     )
+                elif settings.get('show_inviter', True):
+                    embed.add_field(
+                        name='📨 طريقة الانضمام',
+                        value=inviter_name,
+                        inline=False
+                    )
                 
                 await channel.send(embed=embed)
+            
             else:
-                # رسالة نصية
+                # رسالة نصية مع دعم متغير {inviter}
                 message = settings.get('message') or config.get_default_welcome_message()
                 message = helpers.replace_variables(
                     message,
                     mention=member.mention,
                     user=member.name,
                     server=member.guild.name,
-                    membercount=member.guild.member_count
+                    membercount=member.guild.member_count,
+                    inviter=inviter_name,  # ← المتغير الجديد
+                    invitecount=invite_count  # عدد دعوات الداعي
                 )
-                
-                # إضافة معلومات الدعوة
-                if inviter:
-                    invite_count = await invite_tracker.get_user_invites(guild_id, str(inviter.id))
-                    message += f'\n\n📨 تمت دعوته بواسطة {inviter.mention} • **{invite_count}** دعوات'
                 
                 await channel.send(message)
             
