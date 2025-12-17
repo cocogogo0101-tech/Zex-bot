@@ -530,8 +530,137 @@ class Database:
             return []
 
     # ==================== الردود التلقائية ====================
-    # ... باقي الدوال كما كانت بدون تغيير ...
-    # (لم أعدّل بقية الملف خارج إضافة الجداول المطلوبة)
+
+    async def add_autoresponse(
+        self,
+        guild_id: str,
+        trigger: str,
+        response: str,
+        trigger_type: str = 'contains',
+        chance: int = 100,
+        cooldown: int = 0,
+        enabled: int = 1,
+        channels: Optional[str] = None
+    ) -> int:
+        """إضافة رد تلقائي. يعيد الـ id (0 إن فشل)."""
+        try:
+            cursor = await self.conn.execute(
+                'INSERT INTO autoresponses '
+                '(guild_id, trigger, response, trigger_type, enabled, chance, cooldown, channels) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (guild_id, trigger, response, trigger_type, enabled, chance, cooldown, channels)
+            )
+            await self.conn.commit()
+            bot_logger.database_query('INSERT', 'autoresponses', True)
+            return cursor.lastrowid or 0
+        except Exception as e:
+            bot_logger.database_error('add_autoresponse', str(e))
+            return 0
+
+    async def get_autoresponses(self, guild_id: str) -> List[Dict[str, Any]]:
+        """جلب كل الردود التلقائية للسيرفر (قائمة قواميس)."""
+        try:
+            cursor = await self.conn.execute(
+                'SELECT * FROM autoresponses WHERE guild_id = ? ORDER BY id ASC',
+                (guild_id,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            bot_logger.database_error('get_autoresponses', str(e))
+            return []
+
+    async def remove_autoresponse(self, ar_id: int) -> bool:
+        """حذف رد تلقائي حسب الـ id."""
+        try:
+            cursor = await self.conn.execute(
+                'DELETE FROM autoresponses WHERE id = ?',
+                (ar_id,)
+            )
+            await self.conn.commit()
+            return True
+        except Exception as e:
+            bot_logger.database_error('remove_autoresponse', str(e))
+            return False
+
+    async def toggle_autoresponse(self, ar_id: int) -> bool:
+        """تبديل حالة (enabled) لرد تلقائي. يعيد الحالة الجديدة (True=enabled)."""
+        try:
+            cur = await self.conn.execute('SELECT enabled FROM autoresponses WHERE id = ?', (ar_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            current = row[0]
+            new = 0 if (current == 1 or current == True) else 1
+            await self.conn.execute('UPDATE autoresponses SET enabled = ? WHERE id = ?', (new, ar_id))
+            await self.conn.commit()
+            return bool(new)
+        except Exception as e:
+            bot_logger.database_error('toggle_autoresponse', str(e))
+            return False
+
+    async def update_autoresponse(self, ar_id: int, **fields) -> bool:
+        """
+        تعديل حقول الرد التلقائي.
+        مقبول الحقول: trigger, response, trigger_type, enabled, chance, cooldown, channels, last_used
+        """
+        allowed = {'trigger', 'response', 'trigger_type', 'enabled', 'chance', 'cooldown', 'channels', 'last_used'}
+        updates = []
+        params = []
+        for k, v in fields.items():
+            if k in allowed and v is not None:
+                updates.append(f"{k} = ?")
+                params.append(v)
+        if not updates:
+            return False
+        params.append(ar_id)
+        sql = f"UPDATE autoresponses SET {', '.join(updates)} WHERE id = ?"
+        try:
+            await self.conn.execute(sql, tuple(params))
+            await self.conn.commit()
+            return True
+        except Exception as e:
+            bot_logger.database_error('update_autoresponse', str(e))
+            return False
+
+    async def search_autoresponses(self, guild_id: str, query: str) -> List[Dict[str, Any]]:
+        """بحث في المحفز أو الرد بواسطة LIKE."""
+        try:
+            q = f"%{query}%"
+            cursor = await self.conn.execute(
+                'SELECT * FROM autoresponses WHERE guild_id = ? AND (trigger LIKE ? OR response LIKE ?) ORDER BY id ASC',
+                (guild_id, q, q)
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            bot_logger.database_error('search_autoresponses', str(e))
+            return []
+
+    async def get_autoresponse_stats(self, guild_id: str) -> Dict[str, Any]:
+        """إحصائيات بسيطة: total, enabled, disabled, by_type dict."""
+        try:
+            cur = await self.conn.execute('SELECT COUNT(*) FROM autoresponses WHERE guild_id = ?', (guild_id,))
+            total_row = await cur.fetchone()
+            total = total_row[0] if total_row else 0
+
+            cur = await self.conn.execute('SELECT COUNT(*) FROM autoresponses WHERE guild_id = ? AND enabled = 1', (guild_id,))
+            enabled_row = await cur.fetchone()
+            enabled = enabled_row[0] if enabled_row else 0
+
+            disabled = total - enabled
+
+            cur = await self.conn.execute(
+                'SELECT trigger_type, COUNT(*) as cnt FROM autoresponses WHERE guild_id = ? GROUP BY trigger_type',
+                (guild_id,)
+            )
+            rows = await cur.fetchall()
+            by_type = {r[0]: r[1] for r in rows} if rows else {}
+
+            return {'total': total, 'enabled': enabled, 'disabled': disabled, 'by_type': by_type}
+        except Exception as e:
+            bot_logger.database_error('get_autoresponse_stats', str(e))
+            return {'total': 0, 'enabled': 0, 'disabled': 0, 'by_type': {}}
 
 # إنشاء نسخة عامة
 db = Database()
