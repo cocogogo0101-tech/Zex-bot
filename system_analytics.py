@@ -1,194 +1,348 @@
 """
 system_analytics.py
 
-Improved analytics system for Zex-Bot.
+Comprehensive analytics subsystem for Zex-Bot.
 
-Design goals:
-- Integrate with project's existing DB connection if available (module `database`).
-- Fall back to its own aiosqlite connection (analytics.db) if no shared DB present.
-- Provide a module-level `analytics_system` with async methods used by the rest of the project.
-- Be defensive: failing analytics should not crash the bot.
-- Keep API flexible: record_event, get_recent, get_count_by_guild, get_top_events, init, close
+Features:
+- Attempts to reuse project's database connection if available (module `database`).
+- Falls back to its own aiosqlite connection (default file 'analytics.db' or ANALYTICS_DB env).
+- Creates an `analytics_events` table to store events.
+- Provides a module-level `analytics_system` instance with async methods:
+    - init(db_path=None)
+    - record_event(guild_id, user_id, event, metadata=None)
+    - get_recent(limit=50)
+    - get_count_by_guild(guild_id)
+    - get_top_events(limit=10)
+    - close()
+- Defensive: failures in analytics do not raise unhandled exceptions (best-effort).
+- JSON-friendly metadata handling (stores metadata as JSON string if dict provided).
+- Detailed docstrings and examples.
 
-Behavior:
-- On init(), tries to detect and reuse an existing connection from a module named `database`:
-    - looks for attributes: `get_connection`, `conn`, `connection`, `db`, or a function `get_db`
-    - if a shared connection is found, uses it (and will not close it on close())
-- If no shared DB, opens its own aiosqlite connection using ANALYTICS_DB env or 'analytics.db'.
-- Creates table `analytics_events` if missing.
+Usage:
+    from system_analytics import analytics_system
+    await analytics_system.record_event("guild_id", "user_id", "command:help", {"args": []})
 """
+
+from __future__ import annotations
 
 import os
 import asyncio
+import json
 from typing import Optional, List, Dict, Any
 
+# aiosqlite is optional but recommended; we'll handle its absence gracefully.
 try:
     import aiosqlite  # type: ignore
 except Exception:
-    aiosqlite = None  # Will raise on usage if missing
+    aiosqlite = None  # type: ignore
 
 DEFAULT_DB = os.getenv("ANALYTICS_DB", "analytics.db")
 
-class AnalyticsSystem:
-    def __init__(self):
-        self._db_path = DEFAULT_DB
-        self._conn: Optional["aiosqlite.Connection"] = None
-        self._own_connection = False  # whether this instance opened the connection
-        self._init_lock = asyncio.Lock()
-        self._inited = False
 
-    async def _detect_shared_db(self):
+class _NoopCursor:
+    """Fallback cursor that does nothing (used when connection is missing)."""
+
+    def execute(self, *args, **kwargs):
+        return self
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class AnalyticsSystem:
+    """
+    AnalyticsSystem manages a lightweight analytics store.
+
+    It tries to detect and reuse a project's database connection automatically.
+    If not found, it opens its own aiosqlite connection.
+
+    The implementation is defensive: if analytics fails it won't crash the bot.
+    """
+
+    def __init__(self) -> None:
+        self._db_path: str = DEFAULT_DB
+        self._conn: Optional[Any] = None
+        self._own_connection: bool = False
+        self._inited: bool = False
+        self._init_lock = asyncio.Lock()
+
+    # ---------------------
+    # DB detection & utils
+    # ---------------------
+    async def _detect_shared_db(self) -> Optional[Any]:
         """
-        Try to detect a shared DB connection in the project's database module.
+        Try to detect a shared DB connection exported by `database` module.
+
+        Looks for:
+        - async/sync functions: get_connection(), get_db(), get_conn()
+        - attributes: conn, connection, db, db_conn
         Returns a connection-like object or None.
         """
         try:
-            import database  # try project's database module
+            import database  # type: ignore
         except Exception:
             return None
 
-        # Common patterns to look for
-        # functions
-        if hasattr(database, "get_connection") and callable(getattr(database, "get_connection")):
-            try:
-                conn = await database.get_connection()  # some projects use async getter
-                return conn
-            except Exception:
-                try:
-                    conn = database.get_connection()  # sync getter
-                    return conn
-                except Exception:
-                    pass
+        # Try common async getters
+        for fn_name in ("get_connection", "get_db", "get_conn"):
+            if hasattr(database, fn_name):
+                fn = getattr(database, fn_name)
+                if callable(fn):
+                    try:
+                        # prefer awaiting if coroutine
+                        if asyncio.iscoroutinefunction(fn):
+                            conn = await fn()
+                        else:
+                            conn = fn()
+                        if conn:
+                            return conn
+                    except Exception:
+                        # continue to next possibility
+                        pass
 
-        if hasattr(database, "get_db") and callable(getattr(database, "get_db")):
-            try:
-                conn = await database.get_db()
-                return conn
-            except Exception:
-                try:
-                    conn = database.get_db()
-                    return conn
-                except Exception:
-                    pass
-
-        # attributes
+        # Try attributes
         for attr in ("conn", "connection", "db", "db_conn", "connection_obj"):
             if hasattr(database, attr):
                 try:
                     c = getattr(database, attr)
-                    if c is not None:
+                    if c:
                         return c
                 except Exception:
                     pass
 
+        # Some projects expose a wrapper object `db` with an internal connection
+        # Try db.connection or db._conn
+        if hasattr(database, "db"):
+            try:
+                db_obj = getattr(database, "db")
+                for sub in ("connection", "_conn", "_connection", "conn"):
+                    if hasattr(db_obj, sub):
+                        try:
+                            val = getattr(db_obj, sub)
+                            if val:
+                                return val
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         return None
 
-    async def init(self, db_path: Optional[str] = None):
-        """Initialize analytics system. If a shared DB connection exists, reuse it."""
+    def _serialize_metadata(self, metadata: Optional[Any]) -> Optional[str]:
+        """Serialize metadata to a JSON string when possible; otherwise string-cast."""
+        if metadata is None:
+            return None
+        if isinstance(metadata, str):
+            return metadata
+        try:
+            return json.dumps(metadata, default=str, ensure_ascii=False)
+        except Exception:
+            try:
+                return str(metadata)
+            except Exception:
+                return None
+
+    # ---------------------
+    # Initialization
+    # ---------------------
+    async def init(self, db_path: Optional[str] = None) -> None:
+        """
+        Initialize analytics system.
+
+        If `db_path` provided, it overrides the default analytics DB path.
+        This function is idempotent.
+        """
         async with self._init_lock:
             if self._inited:
                 return
+
             if db_path:
                 self._db_path = db_path
 
-            # Try to detect a shared connection in project's database module
-            shared = None
+            # 1) Try to detect a project's shared DB connection
+            shared_conn = None
             try:
-                shared = await self._detect_shared_db()
+                shared_conn = await self._detect_shared_db()
             except Exception:
-                shared = None
+                shared_conn = None
 
-            if shared is not None:
-                # Reuse shared connection (do not close it on analytics.close)
-                self._conn = shared
+            if shared_conn:
+                # Reuse shared connection (do not close it on close())
+                self._conn = shared_conn
                 self._own_connection = False
             else:
-                # Fallback: open our own aiosqlite connection
+                # Fallback: create own aiosqlite connection
                 if aiosqlite is None:
-                    raise RuntimeError("aiosqlite is required for analytics but not installed.")
-                # ensure directory exists
+                    # If aiosqlite not installed, we cannot create an async sqlite connection.
+                    # Keep analytics disabled but do not crash.
+                    self._conn = None
+                    self._own_connection = False
+                    self._inited = True
+                    return
+
+                # Ensure directory exists
                 db_dir = os.path.dirname(self._db_path)
                 if db_dir and not os.path.exists(db_dir):
                     try:
                         os.makedirs(db_dir, exist_ok=True)
                     except Exception:
                         pass
-                self._conn = await aiosqlite.connect(self._db_path)
-                self._own_connection = True
-                # tweak pragmas if possible
-                try:
-                    await self._conn.execute("PRAGMA journal_mode=WAL;")
-                except Exception:
-                    pass
 
-            # Ensure table exists (use try/except to prevent crashes)
-            try:
-                await self._conn.execute("""
-                    CREATE TABLE IF NOT EXISTS analytics_events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        guild_id TEXT,
-                        user_id TEXT,
-                        event TEXT NOT NULL,
-                        metadata TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-                # If using aiosqlite, commit
                 try:
-                    await self._conn.commit()
+                    self._conn = await aiosqlite.connect(self._db_path)
+                    self._own_connection = True
+                    # performance tweak
+                    try:
+                        await self._conn.execute("PRAGMA journal_mode=WAL;")
+                    except Exception:
+                        pass
                 except Exception:
-                    pass
+                    # if can't open DB, mark as inited to avoid retry loops and return
+                    self._conn = None
+                    self._own_connection = False
+                    self._inited = True
+                    return
+
+            # Ensure schema exists (best-effort)
+            try:
+                if self._conn is not None:
+                    # Some connections are sync connections; attempt async execute, else fallback
+                    try:
+                        await self._conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS analytics_events (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                guild_id TEXT,
+                                user_id TEXT,
+                                event TEXT NOT NULL,
+                                metadata TEXT,
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            );
+                            """
+                        )
+                        # commit if possible
+                        try:
+                            await self._conn.commit()
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Try sync execution (for sqlite3.Connection)
+                        try:
+                            cur = self._conn.cursor()
+                            cur.execute(
+                                """
+                                CREATE TABLE IF NOT EXISTS analytics_events (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    guild_id TEXT,
+                                    user_id TEXT,
+                                    event TEXT NOT NULL,
+                                    metadata TEXT,
+                                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                );
+                                """
+                            )
+                            try:
+                                self._conn.commit()
+                            except Exception:
+                                pass
+                            try:
+                                cur.close()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
             except Exception:
-                # swallow; analytics mustn't break bot
+                # swallow any errors related to schema creation
                 pass
 
             self._inited = True
 
-    async def record_event(self, guild_id: Optional[str], user_id: Optional[str], event: str, metadata: Optional[str] = None):
-        """Record a simple analytics event in DB. Best-effort only."""
+    # ---------------------
+    # Recording & Queries
+    # ---------------------
+    async def record_event(
+        self,
+        guild_id: Optional[str],
+        user_id: Optional[str],
+        event: str,
+        metadata: Optional[Any] = None,
+    ) -> None:
+        """
+        Record an analytics event. Best-effort only — failures are swallowed.
+
+        `metadata` can be a dict which will be JSON-serialized.
+        """
         if not self._inited:
             try:
                 await self.init()
             except Exception:
                 return
+
+        if self._conn is None:
+            # No connection available; no-op
+            return
+
+        meta_str = self._serialize_metadata(metadata)
+
+        # Attempt async insert first (aiosqlite-like)
         try:
-            # Some shared dbs (e.g., aiosqlite) use .execute; some use SQLAlchemy-like APIs.
-            # Try basic insert for sqlite-like connections.
             await self._conn.execute(
                 "INSERT INTO analytics_events (guild_id, user_id, event, metadata) VALUES (?, ?, ?, ?);",
-                (guild_id, user_id, event, metadata)
+                (guild_id, user_id, event, meta_str),
             )
             try:
                 await self._conn.commit()
             except Exception:
                 pass
+            return
         except Exception:
-            # best-effort: attempt to use fallback methods (e.g., execute may be sync)
+            # fall through to sync attempt
+            pass
+
+        # Try sync insert (sqlite3.Connection)
+        try:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO analytics_events (guild_id, user_id, event, metadata) VALUES (?, ?, ?, ?);",
+                (guild_id, user_id, event, meta_str),
+            )
             try:
-                # synchronous execute (if connection is sqlite3.Connection)
-                cur = self._conn.cursor()
-                cur.execute(
-                    "INSERT INTO analytics_events (guild_id, user_id, event, metadata) VALUES (?, ?, ?, ?);",
-                    (guild_id, user_id, event, metadata)
-                )
-                try:
-                    self._conn.commit()
-                except Exception:
-                    pass
-                try:
-                    cur.close()
-                except Exception:
-                    pass
+                self._conn.commit()
             except Exception:
-                # give up silently
-                return
+                pass
+            try:
+                cur.close()
+            except Exception:
+                pass
+            return
+        except Exception:
+            # give up silently
+            return
 
     async def get_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return recent events as list of dicts"""
+        """
+        Return recent events as list of dicts:
+        [{id, guild_id, user_id, event, metadata, created_at}, ...]
+        """
         if not self._inited:
             await self.init()
+
+        if self._conn is None:
+            return []
+
+        # Async attempt
         try:
-            cur = await self._conn.execute("SELECT id, guild_id, user_id, event, metadata, created_at FROM analytics_events ORDER BY id DESC LIMIT ?;", (limit,))
+            cur = await self._conn.execute(
+                "SELECT id, guild_id, user_id, event, metadata, created_at "
+                "FROM analytics_events ORDER BY id DESC LIMIT ?;",
+                (limit,),
+            )
             rows = await cur.fetchall()
             try:
                 await cur.close()
@@ -196,40 +350,59 @@ class AnalyticsSystem:
                 pass
             result = []
             for r in rows:
-                result.append({
-                    "id": r[0],
-                    "guild_id": r[1],
-                    "user_id": r[2],
-                    "event": r[3],
-                    "metadata": r[4],
-                    "created_at": r[5]
-                })
-            return result
-        except Exception:
-            # Try sync cursor fallback
-            try:
-                cur = self._conn.cursor()
-                cur.execute("SELECT id, guild_id, user_id, event, metadata, created_at FROM analytics_events ORDER BY id DESC LIMIT ?;", (limit,))
-                rows = cur.fetchall()
-                result = []
-                for r in rows:
-                    result.append({
+                result.append(
+                    {
                         "id": r[0],
                         "guild_id": r[1],
                         "user_id": r[2],
                         "event": r[3],
                         "metadata": r[4],
-                        "created_at": r[5]
-                    })
+                        "created_at": r[5],
+                    }
+                )
+            return result
+        except Exception:
+            # Sync fallback
+            try:
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT id, guild_id, user_id, event, metadata, created_at "
+                    "FROM analytics_events ORDER BY id DESC LIMIT ?;",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                result = []
+                for r in rows:
+                    result.append(
+                        {
+                            "id": r[0],
+                            "guild_id": r[1],
+                            "user_id": r[2],
+                            "event": r[3],
+                            "metadata": r[4],
+                            "created_at": r[5],
+                        }
+                    )
+                try:
+                    cur.close()
+                except Exception:
+                    pass
                 return result
             except Exception:
                 return []
 
     async def get_count_by_guild(self, guild_id: str) -> int:
+        """Return number of events for a given guild_id."""
         if not self._inited:
             await self.init()
+
+        if self._conn is None:
+            return 0
+
         try:
-            cur = await self._conn.execute("SELECT COUNT(*) FROM analytics_events WHERE guild_id = ?;", (guild_id,))
+            cur = await self._conn.execute(
+                "SELECT COUNT(*) FROM analytics_events WHERE guild_id = ?;", (guild_id,)
+            )
             row = await cur.fetchone()
             try:
                 await cur.close()
@@ -241,15 +414,26 @@ class AnalyticsSystem:
                 cur = self._conn.cursor()
                 cur.execute("SELECT COUNT(*) FROM analytics_events WHERE guild_id = ?;", (guild_id,))
                 row = cur.fetchone()
+                try:
+                    cur.close()
+                except Exception:
+                    pass
                 return row[0] if row else 0
             except Exception:
                 return 0
 
     async def get_top_events(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return top events by count."""
         if not self._inited:
             await self.init()
+
+        if self._conn is None:
+            return []
+
         try:
-            cur = await self._conn.execute("SELECT event, COUNT(*) as cnt FROM analytics_events GROUP BY event ORDER BY cnt DESC LIMIT ?;", (limit,))
+            cur = await self._conn.execute(
+                "SELECT event, COUNT(*) as cnt FROM analytics_events GROUP BY event ORDER BY cnt DESC LIMIT ?;", (limit,)
+            )
             rows = await cur.fetchall()
             try:
                 await cur.close()
@@ -261,23 +445,36 @@ class AnalyticsSystem:
                 cur = self._conn.cursor()
                 cur.execute("SELECT event, COUNT(*) as cnt FROM analytics_events GROUP BY event ORDER BY cnt DESC LIMIT ?;", (limit,))
                 rows = cur.fetchall()
+                try:
+                    cur.close()
+                except Exception:
+                    pass
                 return [{"event": r[0], "count": r[1]} for r in rows]
             except Exception:
                 return []
 
-    async def close(self):
-        """Close analytics connection only if we opened it."""
+    # ---------------------
+    # Close
+    # ---------------------
+    async def close(self) -> None:
+        """Close analytics connection only if it was opened by this module."""
         if not self._inited:
             return
         if self._own_connection and self._conn is not None:
             try:
+                # aiosqlite
                 await self._conn.close()
             except Exception:
-                pass
+                try:
+                    # sync sqlite3
+                    self._conn.close()
+                except Exception:
+                    pass
+
         self._conn = None
-        self._inited = False
         self._own_connection = False
+        self._inited = False
+
 
 # Module-level ready-to-use instance
 analytics_system = AnalyticsSystem()
-```0
