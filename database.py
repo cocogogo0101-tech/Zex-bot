@@ -662,5 +662,73 @@ class Database:
             bot_logger.database_error('get_autoresponse_stats', str(e))
             return {'total': 0, 'enabled': 0, 'disabled': 0, 'by_type': {}}
 
+    # ==================== الإحصائيات اليومية (stats) ====================
+    async def increment_stat(self, guild_id: str, stat_name: str, amount: int = 1):
+        """
+        زيادة إحصائية معينة
+
+        Args:
+            guild_id: معرف السيرفر
+            stat_name: اسم الإحصائية (messages, joins, leaves, voice_minutes)
+            amount: المقدار (افتراضي: 1)
+        """
+        try:
+            # الحصول على التاريخ الحالي
+            today = datetime.now().strftime('%Y-%m-%d')
+
+            # التحقق من وجود سجل لليوم
+            cursor = await self.conn.execute(
+                'SELECT * FROM stats WHERE guild_id = ? AND date = ?',
+                (guild_id, today)
+            )
+            row = await cursor.fetchone()
+
+            if row:
+                # تحديث السجل الموجود
+                await self.conn.execute(
+                    f'UPDATE stats SET {stat_name} = {stat_name} + ? WHERE guild_id = ? AND date = ?',
+                    (amount, guild_id, today)
+                )
+            else:
+                # إنشاء سجل جديد
+                await self.conn.execute(
+                    f'INSERT INTO stats (guild_id, date, {stat_name}) VALUES (?, ?, ?)',
+                    (guild_id, today, amount)
+                )
+
+            await self.conn.commit()
+            bot_logger.database_query('UPDATE', 'stats', True)
+
+        except Exception as e:
+            bot_logger.database_error(f'increment_stat: {stat_name}', str(e))
+
+    async def get_stats(self, guild_id: str, days: int = 7) -> List[Dict]:
+        """
+        الحصول على إحصائيات السيرفر لعدة أيام
+
+        Args:
+            guild_id: معرف السيرفر
+            days: عدد الأيام (افتراضي: 7)
+
+        Returns:
+            قائمة الإحصائيات
+        """
+        try:
+            cursor = await self.conn.execute('''
+            SELECT date, messages, joins, leaves, voice_minutes
+            FROM stats
+            WHERE guild_id = ?
+            ORDER BY date DESC
+            LIMIT ?
+        ''', (guild_id, days))
+
+            rows = await cursor.fetchall()
+            return [dict(row) for row in reversed(rows)]  # ترتيب تصاعدي
+
+        except Exception as e:
+            bot_logger.database_error('get_stats', str(e))
+            return []
+
 # إنشاء نسخة عامة
 db = Database()
+```0

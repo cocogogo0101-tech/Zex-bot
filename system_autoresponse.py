@@ -1,6 +1,13 @@
 """
-نظام الردود التلقائية الذكي
-يدعم أنواع متعددة من المطابقة والشروط
+system_autoresponse.py - ENHANCED VERSION
+==========================================
+نظام الردود التلقائية المحسّن مع Logging مفصل
+
+التحديثات:
+✅ Logging مفصل لكل خطوة
+✅ معالجة أخطاء أفضل
+✅ تحسينات الأداء
+✅ دعم متغيرات محسّن
 """
 
 import discord
@@ -9,12 +16,15 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from database import db
 import helpers
+from logger import bot_logger
+
 
 class AutoResponseSystem:
-    """نظام الردود التلقائية"""
+    """نظام الردود التلقائية الذكي"""
     
     def __init__(self):
-        self.cooldowns = {}  # تخزين أوقات الاستخدام الأخيرة
+        self.cooldowns = {}  # {user_id: {response_id: last_time}}
+        bot_logger.info('✅ تم تهيئة نظام الردود التلقائية')
     
     async def check_and_respond(self, message: discord.Message) -> bool:
         """
@@ -23,24 +33,52 @@ class AutoResponseSystem:
         Returns:
             bool: True إذا تم الرد
         """
-        if message.author.bot:
+        try:
+            # Guard: تجاهل البوتات
+            if message.author.bot:
+                return False
+            
+            # Guard: تجاهل الرسائل بدون محتوى
+            if not message.content:
+                return False
+            
+            guild_id = str(message.guild.id)
+            
+            bot_logger.debug(
+                f'🔍 فحص ردود تلقائية: {message.author.name} - "{message.content[:30]}..."'
+            )
+            
+            # جلب جميع الردود التلقائية
+            responses = await db.get_autoresponses(guild_id)
+            
+            if not responses:
+                bot_logger.debug(f'📝 لا توجد ردود تلقائية في {message.guild.name}')
+                return False
+            
+            bot_logger.debug(f'📝 تم جلب {len(responses)} رد تلقائي')
+            
+            # البحث عن رد مطابق
+            for response in responses:
+                # تخطي الردود المعطلة
+                if not response.get('enabled', 1):
+                    continue
+                
+                bot_logger.debug(
+                    f'  🔎 فحص: {response["trigger"]} '
+                    f'({response.get("trigger_type", "contains")})'
+                )
+                
+                if await self._check_response(message, response):
+                    # وجدنا مطابقة!
+                    await self._send_response(message, response)
+                    return True
+            
+            bot_logger.debug('❌ لا توجد ردود مطابقة')
             return False
         
-        guild_id = str(message.guild.id)
-        
-        # جلب جميع الردود التلقائية
-        responses = await db.get_autoresponses(guild_id)
-        
-        if not responses:
+        except Exception as e:
+            bot_logger.exception('خطأ في check_and_respond', e)
             return False
-        
-        # البحث عن رد مطابق
-        for response in responses:
-            if await self._check_response(message, response):
-                await self._send_response(message, response)
-                return True
-        
-        return False
     
     async def _check_response(self, message: discord.Message, response: Dict) -> bool:
         """
@@ -49,93 +87,135 @@ class AutoResponseSystem:
         Returns:
             bool: True إذا كانت مطابقة
         """
-        trigger = response['trigger'].lower()
-        content = message.content.lower()
-        trigger_type = response.get('trigger_type', 'contains')
-        
-        # التحقق من نوع المطابقة
-        matches = False
-        
-        if trigger_type == 'exact':
-            # مطابقة تامة
-            matches = content == trigger
-        
-        elif trigger_type == 'contains':
-            # يحتوي على
-            matches = trigger in content
-        
-        elif trigger_type == 'startswith':
-            # يبدأ بـ
-            matches = content.startswith(trigger)
-        
-        elif trigger_type == 'endswith':
-            # ينتهي بـ
-            matches = content.endswith(trigger)
-        
-        elif trigger_type == 'regex':
-            # تعبير نمطي
-            try:
-                matches = bool(re.search(trigger, content))
-            except re.error:
-                matches = False
-        
-        if not matches:
-            return False
-        
-        # التحقق من القنوات المحددة
-        if response.get('channels'):
-            allowed_channels = response['channels']
-            if str(message.channel.id) not in allowed_channels:
-                return False
-        
-        # التحقق من الـ cooldown
-        cooldown = response.get('cooldown', 0)
-        if cooldown > 0:
-            response_id = response['id']
-            last_used = response.get('last_used')
+        try:
+            trigger = response['trigger'].lower()
+            content = message.content.lower()
+            trigger_type = response.get('trigger_type', 'contains')
             
-            if last_used:
-                last_time = datetime.fromisoformat(last_used)
-                time_passed = (datetime.now() - last_time).total_seconds()
-                
-                if time_passed < cooldown:
+            # 1️⃣ التحقق من نوع المطابقة
+            matches = False
+            
+            if trigger_type == 'exact':
+                matches = content == trigger
+                bot_logger.debug(f'    exact: {content} == {trigger} -> {matches}')
+            
+            elif trigger_type == 'contains':
+                matches = trigger in content
+                bot_logger.debug(f'    contains: {trigger} in {content} -> {matches}')
+            
+            elif trigger_type == 'startswith':
+                matches = content.startswith(trigger)
+                bot_logger.debug(f'    startswith: {content}.startswith({trigger}) -> {matches}')
+            
+            elif trigger_type == 'endswith':
+                matches = content.endswith(trigger)
+                bot_logger.debug(f'    endswith: {content}.endswith({trigger}) -> {matches}')
+            
+            elif trigger_type == 'regex':
+                try:
+                    matches = bool(re.search(trigger, content, re.IGNORECASE))
+                    bot_logger.debug(f'    regex: {trigger} -> {matches}')
+                except re.error as e:
+                    bot_logger.error(f'Regex خاطئ: {trigger} - {e}')
+                    matches = False
+            
+            if not matches:
+                return False
+            
+            bot_logger.debug(f'    ✅ مطابقة نجحت!')
+            
+            # 2️⃣ التحقق من القنوات المحددة
+            if response.get('channels'):
+                allowed_channels = response['channels'].split(',') if isinstance(response['channels'], str) else response['channels']
+                if str(message.channel.id) not in allowed_channels:
+                    bot_logger.debug(f'    ❌ القناة {message.channel.id} غير مسموحة')
                     return False
+            
+            # 3️⃣ التحقق من الـ cooldown
+            cooldown = response.get('cooldown', 0)
+            if cooldown > 0:
+                response_id = response['id']
+                user_id = str(message.author.id)
+                
+                # التحقق من آخر استخدام
+                if user_id in self.cooldowns and response_id in self.cooldowns[user_id]:
+                    last_time = self.cooldowns[user_id][response_id]
+                    time_passed = (datetime.now() - last_time).total_seconds()
+                    
+                    if time_passed < cooldown:
+                        remaining = cooldown - time_passed
+                        bot_logger.debug(
+                            f'    ⏰ Cooldown: باقي {remaining:.1f} ثانية'
+                        )
+                        return False
+            
+            # 4️⃣ التحقق من الاحتمالية (chance)
+            chance = response.get('chance', 100)
+            if chance < 100:
+                if not helpers.roll_chance(chance):
+                    bot_logger.debug(f'    🎲 فشل احتمال {chance}%')
+                    return False
+                bot_logger.debug(f'    🎲 نجح احتمال {chance}%')
+            
+            bot_logger.debug(f'    ✅ جميع الشروط مستوفاة!')
+            return True
         
-        # التحقق من الاحتمالية
-        chance = response.get('chance', 100)
-        if not helpers.roll_chance(chance):
+        except Exception as e:
+            bot_logger.exception(f'خطأ في _check_response', e)
             return False
-        
-        return True
     
     async def _send_response(self, message: discord.Message, response: Dict):
         """إرسال الرد"""
-        response_text = response['response']
-        
-        # استبدال المتغيرات
-        response_text = helpers.replace_variables(
-            response_text,
-            user=message.author.name,
-            mention=message.author.mention,
-            server=message.guild.name,
-            channel=message.channel.name,
-            membercount=message.guild.member_count
-        )
-        
         try:
-            await message.channel.send(response_text)
+            response_text = response['response']
+            response_id = response['id']
+            user_id = str(message.author.id)
+            
+            bot_logger.info(
+                f'📤 إرسال رد تلقائي #{response_id}: '
+                f'{response["trigger"]} -> {message.author.name}'
+            )
+            
+            # استبدال المتغيرات
+            response_text = helpers.replace_variables(
+                response_text,
+                user=message.author.name,
+                mention=message.author.mention,
+                server=message.guild.name,
+                channel=message.channel.name,
+                membercount=message.guild.member_count
+            )
+            
+            # إرسال الرد
+            try:
+                await message.channel.send(response_text)
+                bot_logger.success(f'✅ تم إرسال الرد بنجاح')
+            except discord.Forbidden:
+                bot_logger.error(f'❌ Forbidden: لا يمكن الإرسال في {message.channel.name}')
+                return
+            except discord.HTTPException as e:
+                bot_logger.error(f'❌ HTTPException: {e}')
+                return
             
             # تحديث وقت آخر استخدام
-            await db.conn.execute(
-                'UPDATE autoresponses SET last_used = ? WHERE id = ?',
-                (datetime.now().isoformat(), response['id'])
-            )
-            await db.conn.commit()
+            try:
+                await db.update_autoresponse(
+                    response_id,
+                    last_used=datetime.now().isoformat()
+                )
+                
+                # تحديث cooldown في الذاكرة
+                if user_id not in self.cooldowns:
+                    self.cooldowns[user_id] = {}
+                self.cooldowns[user_id][response_id] = datetime.now()
+                
+                bot_logger.debug('✅ تم تحديث last_used و cooldown')
+            
+            except Exception as e:
+                bot_logger.error(f'خطأ في تحديث last_used: {e}')
         
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
-            pass
+        except Exception as e:
+            bot_logger.exception('خطأ في _send_response', e)
     
     # ==================== إدارة الردود ====================
     
@@ -147,66 +227,80 @@ class AutoResponseSystem:
         trigger_type: str = 'contains',
         chance: int = 100,
         cooldown: int = 0,
-        channels: List[str] = None
+        channels: Optional[str] = None
     ) -> int:
         """
         إضافة رد تلقائي جديد
         
-        Args:
-            guild_id: معرف السيرفر
-            trigger: المحفز (الكلمة/النص)
-            response: الرد
-            trigger_type: نوع المطابقة (exact, contains, startswith, endswith, regex)
-            chance: احتمالية الرد (0-100)
-            cooldown: فترة الانتظار بالثواني
-            channels: قائمة معرفات القنوات المسموحة
-        
         Returns:
-            int: معرف الرد
+            int: معرف الرد (0 إن فشل)
         """
-        return await db.add_autoresponse(
-            guild_id,
-            trigger,
-            response,
-            trigger_type,
-            channels
-        )
+        try:
+            response_id = await db.add_autoresponse(
+                guild_id,
+                trigger,
+                response,
+                trigger_type,
+                chance,
+                cooldown,
+                1,  # enabled
+                channels
+            )
+            
+            if response_id:
+                bot_logger.success(
+                    f'✅ تم إضافة رد تلقائي #{response_id}: '
+                    f'{trigger} -> {response[:30]}...'
+                )
+            else:
+                bot_logger.error('❌ فشل إضافة الرد التلقائي')
+            
+            return response_id
+        
+        except Exception as e:
+            bot_logger.exception('خطأ في add_response', e)
+            return 0
     
     async def remove_response(self, response_id: int) -> bool:
-        """
-        حذف رد تلقائي
+        """حذف رد تلقائي"""
+        try:
+            success = await db.remove_autoresponse(response_id)
+            
+            if success:
+                bot_logger.success(f'✅ تم حذف رد تلقائي #{response_id}')
+            else:
+                bot_logger.error(f'❌ فشل حذف رد تلقائي #{response_id}')
+            
+            return success
         
-        Args:
-            response_id: معرف الرد
-        
-        Returns:
-            bool: True إذا نجح الحذف
-        """
-        return await db.remove_autoresponse(response_id)
+        except Exception as e:
+            bot_logger.exception(f'خطأ في remove_response: {response_id}', e)
+            return False
     
     async def toggle_response(self, response_id: int) -> bool:
-        """
-        تفعيل/تعطيل رد تلقائي
+        """تفعيل/تعطيل رد تلقائي"""
+        try:
+            new_state = await db.toggle_autoresponse(response_id)
+            
+            status = 'مفعل' if new_state else 'معطل'
+            bot_logger.success(f'✅ الرد #{response_id} الآن {status}')
+            
+            return True
         
-        Args:
-            response_id: معرف الرد
-        
-        Returns:
-            bool: True إذا نجحت العملية
-        """
-        return await db.toggle_autoresponse(response_id)
+        except Exception as e:
+            bot_logger.exception(f'خطأ في toggle_response: {response_id}', e)
+            return False
     
     async def get_responses(self, guild_id: str) -> List[Dict]:
-        """
-        الحصول على جميع الردود التلقائية
+        """الحصول على جميع الردود التلقائية"""
+        try:
+            responses = await db.get_autoresponses(guild_id)
+            bot_logger.debug(f'📝 تم جلب {len(responses)} رد من DB')
+            return responses
         
-        Args:
-            guild_id: معرف السيرفر
-        
-        Returns:
-            list: قائمة الردود
-        """
-        return await db.get_autoresponses(guild_id)
+        except Exception as e:
+            bot_logger.exception(f'خطأ في get_responses: {guild_id}', e)
+            return []
     
     async def update_response(
         self,
@@ -216,56 +310,31 @@ class AutoResponseSystem:
         trigger_type: str = None,
         chance: int = None,
         cooldown: int = None
-    ):
-        """
-        تحديث رد تلقائي
+    ) -> bool:
+        """تحديث رد تلقائي"""
+        try:
+            success = await db.update_autoresponse(
+                response_id,
+                trigger=trigger,
+                response=response,
+                trigger_type=trigger_type,
+                chance=chance,
+                cooldown=cooldown
+            )
+            
+            if success:
+                bot_logger.success(f'✅ تم تحديث رد تلقائي #{response_id}')
+            
+            return success
         
-        Args:
-            response_id: معرف الرد
-            trigger: المحفز الجديد
-            response: الرد الجديد
-            trigger_type: نوع المطابقة الجديد
-            chance: الاحتمالية الجديدة
-            cooldown: الانتظار الجديد
-        """
-        updates = []
-        values = []
-        
-        if trigger is not None:
-            updates.append('trigger = ?')
-            values.append(trigger)
-        
-        if response is not None:
-            updates.append('response = ?')
-            values.append(response)
-        
-        if trigger_type is not None:
-            updates.append('trigger_type = ?')
-            values.append(trigger_type)
-        
-        if chance is not None:
-            updates.append('chance = ?')
-            values.append(chance)
-        
-        if cooldown is not None:
-            updates.append('cooldown = ?')
-            values.append(cooldown)
-        
-        if updates:
-            values.append(response_id)
-            query = f"UPDATE autoresponses SET {', '.join(updates)} WHERE id = ?"
-            await db.conn.execute(query, tuple(values))
-            await db.conn.commit()
+        except Exception as e:
+            bot_logger.exception(f'خطأ في update_response: {response_id}', e)
+            return False
     
-    # ==================== قوالب جاهزة ====================
+    # ==================== القوالب الجاهزة ====================
     
     def get_template_responses(self) -> List[Dict]:
-        """
-        الحصول على قوالب ردود جاهزة
-        
-        Returns:
-            list: قائمة القوالب
-        """
+        """الحصول على قوالب ردود جاهزة"""
         return [
             {
                 'trigger': 'السلام عليكم',
@@ -318,16 +387,7 @@ class AutoResponseSystem:
         ]
     
     async def add_template(self, guild_id: str, template_index: int) -> Optional[int]:
-        """
-        إضافة قالب جاهز
-        
-        Args:
-            guild_id: معرف السيرفر
-            template_index: رقم القالب
-        
-        Returns:
-            int: معرف الرد أو None
-        """
+        """إضافة قالب جاهز"""
         templates = self.get_template_responses()
         
         if 0 <= template_index < len(templates):
@@ -341,32 +401,15 @@ class AutoResponseSystem:
         
         return None
     
-    # ==================== التحليل والإحصائيات ====================
+    # ==================== الإحصائيات ====================
     
     async def get_response_stats(self, guild_id: str) -> Dict:
-        """
-        الحصول على إحصائيات الردود
-        
-        Returns:
-            dict: الإحصائيات
-        """
-        responses = await self.get_responses(guild_id)
-        
-        total = len(responses)
-        enabled = sum(1 for r in responses if r.get('enabled', 1))
-        disabled = total - enabled
-        
-        types = {}
-        for r in responses:
-            t = r.get('trigger_type', 'contains')
-            types[t] = types.get(t, 0) + 1
-        
-        return {
-            'total': total,
-            'enabled': enabled,
-            'disabled': disabled,
-            'by_type': types
-        }
+        """الحصول على إحصائيات الردود"""
+        try:
+            return await db.get_autoresponse_stats(guild_id)
+        except Exception as e:
+            bot_logger.exception(f'خطأ في get_response_stats: {guild_id}', e)
+            return {'total': 0, 'enabled': 0, 'disabled': 0, 'by_type': {}}
     
     async def search_responses(
         self,
@@ -375,111 +418,28 @@ class AutoResponseSystem:
         trigger_type: str = None,
         enabled: bool = None
     ) -> List[Dict]:
-        """
-        البحث في الردود التلقائية
-        
-        Args:
-            guild_id: معرف السيرفر
-            query: نص البحث
-            trigger_type: نوع المطابقة للتصفية
-            enabled: الحالة للتصفية
-        
-        Returns:
-            list: قائمة الردود المطابقة
-        """
-        responses = await self.get_responses(guild_id)
-        
-        results = []
-        for response in responses:
-            # تطبيق التصفية
-            if enabled is not None and bool(response.get('enabled', 1)) != enabled:
-                continue
-            
-            if trigger_type and response.get('trigger_type') != trigger_type:
-                continue
-            
+        """البحث في الردود التلقائية"""
+        try:
             if query:
-                query_lower = query.lower()
-                trigger_lower = response['trigger'].lower()
-                response_lower = response['response'].lower()
+                return await db.search_autoresponses(guild_id, query)
+            else:
+                responses = await self.get_responses(guild_id)
                 
-                if query_lower not in trigger_lower and query_lower not in response_lower:
-                    continue
-            
-            results.append(response)
+                # تطبيق الفلاتر
+                if trigger_type:
+                    responses = [r for r in responses if r.get('trigger_type') == trigger_type]
+                
+                if enabled is not None:
+                    responses = [r for r in responses if bool(r.get('enabled', 1)) == enabled]
+                
+                return responses
         
-        return results
-    
-    # ==================== التنسيق ====================
-    
-    def format_response_list(self, responses: List[Dict], page: int = 1, per_page: int = 10) -> str:
-        """
-        تنسيق قائمة الردود
-        
-        Args:
-            responses: قائمة الردود
-            page: رقم الصفحة
-            per_page: عدد العناصر في الصفحة
-        
-        Returns:
-            str: نص منسق
-        """
-        if not responses:
-            return 'لا توجد ردود تلقائية.'
-        
-        start = (page - 1) * per_page
-        end = start + per_page
-        page_responses = responses[start:end]
-        
-        lines = [f'📝 **الردود التلقائية** (الصفحة {page}/{(len(responses)-1)//per_page + 1})\n']
-        
-        for i, response in enumerate(page_responses, start=start + 1):
-            status = '✅' if response.get('enabled', 1) else '❌'
-            trigger = response['trigger']
-            trigger_type = response.get('trigger_type', 'contains')
-            response_text = helpers.truncate_text(response['response'], 50)
-            
-            lines.append(
-                f'**{i}.** {status} `ID:{response["id"]}`\n'
-                f'└─ المحفز: `{trigger}` ({trigger_type})\n'
-                f'└─ الرد: {response_text}\n'
-            )
-        
-        return '\n'.join(lines)
-    
-    def format_response_detail(self, response: Dict) -> str:
-        """
-        تنسيق تفاصيل رد واحد
-        
-        Args:
-            response: بيانات الرد
-        
-        Returns:
-            str: نص منسق
-        """
-        status = '✅ مفعل' if response.get('enabled', 1) else '❌ معطل'
-        
-        lines = [
-            f'📝 **تفاصيل الرد #{response["id"]}**\n',
-            f'**الحالة:** {status}',
-            f'**المحفز:** `{response["trigger"]}`',
-            f'**نوع المطابقة:** {response.get("trigger_type", "contains")}',
-            f'**الرد:** {response["response"]}',
-            f'**الاحتمالية:** {response.get("chance", 100)}%',
-            f'**الانتظار:** {response.get("cooldown", 0)} ثانية'
-        ]
-        
-        if response.get('channels'):
-            channels = ', '.join([f'<#{ch}>' for ch in response['channels']])
-            lines.append(f'**القنوات المحددة:** {channels}')
-        else:
-            lines.append('**القنوات المحددة:** جميع القنوات')
-        
-        if response.get('last_used'):
-            last_used = helpers.format_datetime(response['last_used'])
-            lines.append(f'**آخر استخدام:** {last_used}')
-        
-        return '\n'.join(lines)
+        except Exception as e:
+            bot_logger.exception(f'خطأ في search_responses: {guild_id}', e)
+            return []
+
 
 # إنشاء نسخة عامة
 autoresponse_system = AutoResponseSystem()
+
+bot_logger.success('✅ تم تحميل نظام الردود التلقائية المحسّن')
