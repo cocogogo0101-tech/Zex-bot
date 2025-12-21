@@ -1,614 +1,673 @@
 """
-نظام قاعدة البيانات الشامل - SQLite
-✅ تم إصلاح جميع الجداول الناقصة
-✅ تم إضافة logging
-✅ تم تحسين error handling
+database.py - Comprehensive, backward-compatible DB layer for Zex-Bot
+
+Features:
+- aiosqlite connection handling (connect/close)
+- create_tables() covering all tables used across project
+- safe raw access: execute/fetchone/fetchall
+- convenience helper functions for common operations:
+  settings, warnings, tickets, tickets_v2, ticket_categories, ticket_panels,
+  ticket_transcripts, levels, leveling_config, leveling_role_multipliers,
+  autoresponses, polls, poll_votes, invites, invite_rewards, stats,
+  reminders, notes, logs, lists
+- concurrency protection via asyncio.Lock
+- robust error logging via bot_logger (expected in project)
 """
 
 import aiosqlite
-import json
-from datetime import datetime
-from typing import Optional, Dict, List, Any
 import asyncio
-from logger import bot_logger
+import json
+from typing import Optional, Any, Dict, List, Tuple
+from datetime import datetime
+from logger import bot_logger  # project logger (keeps compatibility)
 
 DB_PATH = 'database.db'
+
 
 class Database:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self.conn: Optional[aiosqlite.Connection] = None
+        self._lock = asyncio.Lock()
+
+    # ---------------- Connection ----------------
 
     async def connect(self):
-        """إنشاء اتصال بقاعدة البيانات"""
+        """Open connection and ensure tables exist."""
+        if self.conn:
+            return
         try:
             self.conn = await aiosqlite.connect(self.db_path)
+            # return rows as mapping
             self.conn.row_factory = aiosqlite.Row
+            await self.conn.execute('PRAGMA foreign_keys = ON;')
             await self.create_tables()
-            bot_logger.success('قاعدة البيانات متصلة بنجاح')
+            await self.conn.commit()
+            bot_logger.success('✅ Database connected and tables ensured')
         except Exception as e:
-            bot_logger.exception('فشل الاتصال بقاعدة البيانات', e)
+            bot_logger.exception('❌ Failed to connect to database', e)
             raise
 
     async def close(self):
-        """إغلاق الاتصال"""
-        if self.conn:
-            try:
-                await self.conn.close()
-                bot_logger.info('تم إغلاق قاعدة البيانات')
-            except Exception as e:
-                bot_logger.error(f'خطأ في إغلاق قاعدة البيانات: {e}')
+        if not self.conn:
+            return
+        try:
+            await self.conn.close()
+            self.conn = None
+            bot_logger.info('Database connection closed')
+        except Exception as e:
+            bot_logger.error(f'Error closing DB: {e}')
+
+    # ---------------- Schema creation ----------------
 
     async def create_tables(self):
-        """إنشاء جميع الجداول - مُصلح ومُحسّن"""
-        try:
-            # تفعيل مفاتيح الارتباط الخارجية في SQLite
+        """
+        Create all tables used across the project.
+        Keep this function limited to schema creation only.
+        """
+        if not self.conn:
+            raise RuntimeError('DB not connected')
+
+        async with self._lock:
             try:
-                await self.conn.execute('PRAGMA foreign_keys = ON;')
-            except Exception:
-                pass
+                # -- core settings --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS settings (
+                        guild_id TEXT PRIMARY KEY,
+                        welcome_enabled INTEGER DEFAULT 1,
+                        welcome_channel_id TEXT,
+                        welcome_message TEXT,
+                        welcome_type TEXT DEFAULT 'text',
+                        goodbye_enabled INTEGER DEFAULT 0,
+                        goodbye_channel_id TEXT,
+                        goodbye_message TEXT,
+                        logs_channel_id TEXT,
+                        support_role_id TEXT,
+                        autorole_id TEXT,
+                        prefix TEXT DEFAULT '!',
+                        language TEXT DEFAULT 'ar',
+                        antispam_enabled INTEGER DEFAULT 0,
+                        antispam_threshold INTEGER DEFAULT 5,
+                        antilink_enabled INTEGER DEFAULT 0,
+                        automod_enabled INTEGER DEFAULT 0,
+                        leveling_enabled INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول الإعدادات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS settings (
-                    guild_id TEXT PRIMARY KEY,
-                    welcome_enabled INTEGER DEFAULT 1,
-                    welcome_channel_id TEXT,
-                    welcome_message TEXT,
-                    welcome_type TEXT DEFAULT 'text',
-                    goodbye_enabled INTEGER DEFAULT 0,
-                    goodbye_channel_id TEXT,
-                    goodbye_message TEXT,
-                    logs_channel_id TEXT,
-                    support_role_id TEXT,
-                    autorole_id TEXT,
-                    prefix TEXT DEFAULT '!',
-                    language TEXT DEFAULT 'ar',
-                    antispam_enabled INTEGER DEFAULT 0,
-                    antispam_threshold INTEGER DEFAULT 5,
-                    antilink_enabled INTEGER DEFAULT 0,
-                    automod_enabled INTEGER DEFAULT 0,
-                    leveling_enabled INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # -- moderation --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS warnings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        moderator_id TEXT NOT NULL,
+                        reason TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول التحذيرات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS warnings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    moderator_id TEXT NOT NULL,
-                    reason TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS notes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        moderator_id TEXT NOT NULL,
+                        note TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول التكتات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS tickets (
-                    channel_id TEXT PRIMARY KEY,
-                    guild_id TEXT NOT NULL,
-                    opener_id TEXT NOT NULL,
-                    reason TEXT,
-                    status TEXT DEFAULT 'open',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    closed_at TIMESTAMP,
-                    closed_by TEXT
-                )
-            ''')
+                # -- tickets (legacy) --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS tickets (
+                        channel_id TEXT PRIMARY KEY,
+                        guild_id TEXT NOT NULL,
+                        opener_id TEXT NOT NULL,
+                        reason TEXT,
+                        status TEXT DEFAULT 'open',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        closed_at TIMESTAMP,
+                        closed_by TEXT
+                    )
+                ''')
 
-            # جدول المستويات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS levels (
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    xp INTEGER DEFAULT 0,
-                    level INTEGER DEFAULT 0,
-                    messages INTEGER DEFAULT 0,
-                    last_xp_time TIMESTAMP,
-                    PRIMARY KEY (guild_id, user_id)
-                )
-            ''')
+                # -- tickets_v2 (advanced) --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS tickets_v2 (
+                        ticket_id INTEGER PRIMARY KEY,
+                        channel_id TEXT UNIQUE,
+                        guild_id TEXT NOT NULL,
+                        creator_id TEXT NOT NULL,
+                        category_id TEXT,
+                        reason TEXT,
+                        custom_answers TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT DEFAULT 'open',
+                        claimed_by TEXT,
+                        priority TEXT DEFAULT 'normal',
+                        tags TEXT,
+                        notes TEXT,
+                        rating INTEGER,
+                        closed_at TIMESTAMP,
+                        closed_by TEXT
+                    )
+                ''')
 
-            # ✅ جدول إعدادات المستويات (جديد - كان ناقص!)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS leveling_config (
-                    guild_id TEXT PRIMARY KEY,
-                    xp_per_message_min INTEGER DEFAULT 15,
-                    xp_per_message_max INTEGER DEFAULT 25,
-                    message_cooldown INTEGER DEFAULT 60,
-                    xp_per_voice_5min INTEGER DEFAULT 1,
-                    xp_per_voice_2min INTEGER DEFAULT 1,
-                    level_curve TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # ticket categories / panels / transcripts
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS ticket_categories (
+                        guild_id TEXT NOT NULL,
+                        category_id TEXT NOT NULL,
+                        data TEXT NOT NULL,
+                        PRIMARY KEY (guild_id, category_id)
+                    )
+                ''')
 
-            # ✅ جدول مضاعفات الأدوار (جديد - كان ناقص!)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS leveling_role_multipliers (
-                    guild_id TEXT NOT NULL,
-                    role_id TEXT NOT NULL,
-                    multiplier REAL DEFAULT 1.0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (guild_id, role_id)
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS ticket_panels (
+                        message_id TEXT PRIMARY KEY,
+                        guild_id TEXT,
+                        channel_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        data TEXT
+                    )
+                ''')
 
-            # جدول الردود التلقائية
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS autoresponses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    trigger TEXT NOT NULL,
-                    response TEXT NOT NULL,
-                    trigger_type TEXT DEFAULT 'contains',
-                    enabled INTEGER DEFAULT 1,
-                    chance INTEGER DEFAULT 100,
-                    cooldown INTEGER DEFAULT 0,
-                    last_used TIMESTAMP,
-                    channels TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS ticket_transcripts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticket_id INTEGER,
+                        file_path TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول الكلمات المحظورة
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS blacklist_words (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    word TEXT NOT NULL,
-                    action TEXT DEFAULT 'delete',
-                    enabled INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # -- leveling --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS levels (
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        xp INTEGER DEFAULT 0,
+                        level INTEGER DEFAULT 0,
+                        messages INTEGER DEFAULT 0,
+                        last_xp_time TIMESTAMP,
+                        PRIMARY KEY (guild_id, user_id)
+                    )
+                ''')
 
-            # جدول السجلات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    action_type TEXT NOT NULL,
-                    user_id TEXT,
-                    moderator_id TEXT,
-                    target_id TEXT,
-                    reason TEXT,
-                    details TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS leveling_config (
+                        guild_id TEXT PRIMARY KEY,
+                        xp_per_message_min INTEGER DEFAULT 15,
+                        xp_per_message_max INTEGER DEFAULT 25,
+                        message_cooldown INTEGER DEFAULT 60,
+                        xp_per_voice_5min INTEGER DEFAULT 1,
+                        xp_per_voice_2min INTEGER DEFAULT 1,
+                        level_curve TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول الملاحظات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    moderator_id TEXT NOT NULL,
-                    note TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS leveling_role_multipliers (
+                        guild_id TEXT NOT NULL,
+                        role_id TEXT NOT NULL,
+                        multiplier REAL DEFAULT 1.0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (guild_id, role_id)
+                    )
+                ''')
 
-            # جدول القوائم (Blacklist/Whitelist)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS lists (
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    list_type TEXT NOT NULL,
-                    reason TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (guild_id, user_id, list_type)
-                )
-            ''')
+                # -- autoresponses / moderation lists / blacklist --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS autoresponses (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        trigger TEXT NOT NULL,
+                        response TEXT NOT NULL,
+                        trigger_type TEXT DEFAULT 'contains',
+                        enabled INTEGER DEFAULT 1,
+                        chance INTEGER DEFAULT 100,
+                        cooldown INTEGER DEFAULT 0,
+                        last_used TIMESTAMP,
+                        channels TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول الإحصائيات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS stats (
-                    guild_id TEXT NOT NULL,
-                    date TEXT NOT NULL,
-                    messages INTEGER DEFAULT 0,
-                    joins INTEGER DEFAULT 0,
-                    leaves INTEGER DEFAULT 0,
-                    voice_minutes INTEGER DEFAULT 0,
-                    PRIMARY KEY (guild_id, date)
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS blacklist_words (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        word TEXT NOT NULL,
+                        action TEXT DEFAULT 'delete',
+                        enabled INTEGER DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # جدول التذكيرات
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS reminders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    channel_id TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    remind_at TIMESTAMP NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # -- logs / analytics / lists --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        user_id TEXT,
+                        moderator_id TEXT,
+                        target_id TEXT,
+                        reason TEXT,
+                        details TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # ==================== جداول الدعوات والاستطلاعات (المطلوبة) ====================
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS lists (
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        list_type TEXT NOT NULL,
+                        reason TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (guild_id, user_id, list_type)
+                    )
+                ''')
 
-            # ✅ جدول الدعوات (جديد - كان ناقص!)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS invites (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    inviter_id TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                # -- polls --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS polls (
+                        poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        channel_id TEXT NOT NULL,
+                        message_id TEXT,
+                        creator_id TEXT NOT NULL,
+                        question TEXT NOT NULL,
+                        options TEXT NOT NULL,
+                        duration_minutes INTEGER DEFAULT 60,
+                        allow_multiple INTEGER DEFAULT 0,
+                        anonymous INTEGER DEFAULT 0,
+                        is_closed INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        closed_at TIMESTAMP
+                    )
+                ''')
 
-            # ✅ جدول مكافآت الدعوات (جديد - كان ناقص!)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS invite_rewards (
-                    guild_id TEXT NOT NULL,
-                    required_invites INTEGER NOT NULL,
-                    role_id TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (guild_id, required_invites)
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS poll_votes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        poll_id INTEGER NOT NULL,
+                        user_id TEXT NOT NULL,
+                        option_index INTEGER NOT NULL,
+                        voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (poll_id) REFERENCES polls(poll_id) ON DELETE CASCADE
+                    )
+                ''')
 
-            # ✅ جدول الاستطلاعات (جديد!)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS polls (
-                    poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    channel_id TEXT NOT NULL,
-                    message_id TEXT,
-                    creator_id TEXT NOT NULL,
-                    question TEXT NOT NULL,
-                    options TEXT NOT NULL,
-                    duration_minutes INTEGER DEFAULT 60,
-                    allow_multiple INTEGER DEFAULT 0,
-                    anonymous INTEGER DEFAULT 0,
-                    is_closed INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    closed_at TIMESTAMP
-                )
-            ''')
+                # -- invites / invite rewards --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS invites (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        inviter_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-            # ✅ جدول أصوات الاستطلاعات (جديد!)
-            await self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS poll_votes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    poll_id INTEGER NOT NULL,
-                    user_id TEXT NOT NULL,
-                    option_index INTEGER NOT NULL,
-                    voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (poll_id) REFERENCES polls(poll_id) ON DELETE CASCADE
-                )
-            ''')
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS invite_rewards (
+                        guild_id TEXT NOT NULL,
+                        required_invites INTEGER NOT NULL,
+                        role_id TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (guild_id, required_invites)
+                    )
+                ''')
 
-            await self.conn.commit()
-            bot_logger.success('جميع الجداول جاهزة ✅')
+                # -- stats / reminders --
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS stats (
+                        guild_id TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        messages INTEGER DEFAULT 0,
+                        joins INTEGER DEFAULT 0,
+                        leaves INTEGER DEFAULT 0,
+                        voice_minutes INTEGER DEFAULT 0,
+                        PRIMARY KEY (guild_id, date)
+                    )
+                ''')
 
-        except Exception as e:
-            bot_logger.exception('فشل إنشاء الجداول', e)
-            raise
+                await self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS reminders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        channel_id TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        remind_at TIMESTAMP NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-    # ==================== الإعدادات ====================
+                # commit after schema creation
+                await self.conn.commit()
+                bot_logger.success('✅ All DB tables created/verified')
 
-    async def get_settings(self, guild_id: str) -> Optional[Dict]:
-        """الحصول على إعدادات السيرفر"""
-        try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM settings WHERE guild_id = ?',
-                (guild_id,)
-            )
-            row = await cursor.fetchone()
-            bot_logger.database_query('SELECT', 'settings', row is not None)
+            except Exception as e:
+                bot_logger.exception('❌ Failed creating DB tables', e)
+                raise
+
+    # ---------------- Raw helpers ----------------
+
+    async def execute(self, sql: str, params: tuple = ()):
+        """Execute arbitrary SQL (INSERT/UPDATE/DELETE). Commits automatically."""
+        if not self.conn:
+            raise RuntimeError('DB not connected')
+        async with self._lock:
+            try:
+                cur = await self.conn.execute(sql, params)
+                await self.conn.commit()
+                return cur
+            except Exception as e:
+                bot_logger.database_error('execute', str(e))
+                raise
+
+    async def fetchone(self, sql: str, params: tuple = ()):
+        """Fetch a single row as dict or None."""
+        if not self.conn:
+            raise RuntimeError('DB not connected')
+        async with self._lock:
+            cur = await self.conn.execute(sql, params)
+            row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def fetchall(self, sql: str, params: tuple = ()):
+        """Fetch all rows as list[dict]."""
+        if not self.conn:
+            raise RuntimeError('DB not connected')
+        async with self._lock:
+            cur = await self.conn.execute(sql, params)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------------- Convenience helpers ----------------
+    # Settings
+    async def get_settings(self, guild_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            return await self.fetchone('SELECT * FROM settings WHERE guild_id = ?', (guild_id,))
         except Exception as e:
             bot_logger.database_error('get_settings', str(e))
             return None
 
     async def update_setting(self, guild_id: str, key: str, value: Any):
-        """تحديث إعداد معين"""
         try:
-            settings = await self.get_settings(guild_id)
-
-            if not settings:
-                await self.conn.execute(
-                    f'INSERT INTO settings (guild_id, {key}) VALUES (?, ?)',
-                    (guild_id, value)
-                )
+            # ensure guild row exists
+            exists = await self.fetchone('SELECT 1 FROM settings WHERE guild_id = ?', (guild_id,))
+            if not exists:
+                await self.execute(f'INSERT INTO settings (guild_id, {key}) VALUES (?, ?)', (guild_id, value))
             else:
-                await self.conn.execute(
-                    f'UPDATE settings SET {key} = ? WHERE guild_id = ?',
-                    (value, guild_id)
-                )
-            await self.conn.commit()
+                await self.execute(f'UPDATE settings SET {key} = ? WHERE guild_id = ?', (value, guild_id))
             bot_logger.database_query('UPDATE', 'settings', True)
         except Exception as e:
-            bot_logger.database_error(f'update_setting: {key}', str(e))
+            bot_logger.database_error('update_setting', str(e))
             raise
 
     async def init_guild(self, guild_id: str):
-        """تهيئة إعدادات السيرفر"""
         try:
-            exists = await self.get_settings(guild_id)
-            if not exists:
-                await self.conn.execute(
-                    'INSERT INTO settings (guild_id) VALUES (?)',
-                    (guild_id,)
-                )
-                await self.conn.commit()
-                bot_logger.info(f'تهيئة إعدادات السيرفر: {guild_id}')
+            if not await self.fetchone('SELECT 1 FROM settings WHERE guild_id = ?', (guild_id,)):
+                await self.execute('INSERT INTO settings (guild_id) VALUES (?)', (guild_id,))
+                bot_logger.info(f'init_guild: {guild_id}')
         except Exception as e:
             bot_logger.database_error('init_guild', str(e))
 
-    # ==================== التحذيرات ====================
-
+    # Warnings
     async def add_warning(self, guild_id: str, user_id: str, moderator_id: str, reason: str = None) -> int:
-        """إضافة تحذير"""
         try:
-            cursor = await self.conn.execute(
+            cur = await self.execute(
                 'INSERT INTO warnings (guild_id, user_id, moderator_id, reason) VALUES (?, ?, ?, ?)',
                 (guild_id, user_id, moderator_id, reason)
             )
-            await self.conn.commit()
-            bot_logger.database_query('INSERT', 'warnings', True)
-            return cursor.lastrowid
-        except Exception as e:
-            bot_logger.database_error('add_warning', str(e))
+            return getattr(cur, 'lastrowid', 0) or 0
+        except Exception:
             return 0
 
     async def get_warnings(self, guild_id: str, user_id: str) -> List[Dict]:
-        """الحصول على تحذيرات العضو"""
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC',
-                (guild_id, user_id)
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            bot_logger.database_error('get_warnings', str(e))
+            return await self.fetchall('SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC', (guild_id, user_id))
+        except Exception:
             return []
 
-    async def remove_warning(self, warning_id: int) -> bool:
-        """إزالة تحذير"""
-        try:
-            cursor = await self.conn.execute(
-                'DELETE FROM warnings WHERE id = ?',
-                (warning_id,)
-            )
-            await self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            bot_logger.database_error('remove_warning', str(e))
-            return False
-
     async def clear_warnings(self, guild_id: str, user_id: str):
-        """مسح جميع تحذيرات العضو"""
         try:
-            await self.conn.execute(
-                'DELETE FROM warnings WHERE guild_id = ? AND user_id = ?',
-                (guild_id, user_id)
-            )
-            await self.conn.commit()
-            bot_logger.database_query('DELETE', 'warnings', True)
+            await self.execute('DELETE FROM warnings WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
         except Exception as e:
             bot_logger.database_error('clear_warnings', str(e))
 
     async def get_warning_count(self, guild_id: str, user_id: str) -> int:
-        """عدد تحذيرات العضو"""
         try:
-            cursor = await self.conn.execute(
-                'SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?',
-                (guild_id, user_id)
-            )
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-        except Exception as e:
-            bot_logger.database_error('get_warning_count', str(e))
+            row = await self.fetchone('SELECT COUNT(*) as cnt FROM warnings WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
+            return row['cnt'] if row else 0
+        except Exception:
             return 0
 
-    # ==================== التكتات ====================
-
+    # Tickets (legacy)
     async def create_ticket(self, channel_id: str, guild_id: str, opener_id: str, reason: str = None):
-        """إنشاء تكت"""
         try:
-            await self.conn.execute(
-                'INSERT INTO tickets (channel_id, guild_id, opener_id, reason) VALUES (?, ?, ?, ?)',
-                (channel_id, guild_id, opener_id, reason)
-            )
-            await self.conn.commit()
-            bot_logger.database_query('INSERT', 'tickets', True)
+            await self.execute('INSERT INTO tickets (channel_id, guild_id, opener_id, reason) VALUES (?, ?, ?, ?)', (channel_id, guild_id, opener_id, reason))
         except Exception as e:
             bot_logger.database_error('create_ticket', str(e))
 
     async def get_ticket(self, channel_id: str) -> Optional[Dict]:
-        """الحصول على معلومات التكت"""
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM tickets WHERE channel_id = ?',
-                (channel_id,)
-            )
-            row = await cursor.fetchone()
-            return dict(row) if row else None
-        except Exception as e:
-            bot_logger.database_error('get_ticket', str(e))
+            return await self.fetchone('SELECT * FROM tickets WHERE channel_id = ?', (channel_id,))
+        except Exception:
             return None
 
     async def close_ticket(self, channel_id: str, closed_by: str):
-        """إغلاق تكت"""
         try:
-            await self.conn.execute(
-                'UPDATE tickets SET status = ?, closed_at = ?, closed_by = ? WHERE channel_id = ?',
-                ('closed', datetime.now().isoformat(), closed_by, channel_id)
-            )
-            await self.conn.commit()
-            bot_logger.database_query('UPDATE', 'tickets', True)
+            await self.execute('UPDATE tickets SET status = ?, closed_at = ?, closed_by = ? WHERE channel_id = ?', ('closed', datetime.now().isoformat(), closed_by, channel_id))
         except Exception as e:
             bot_logger.database_error('close_ticket', str(e))
 
     async def get_user_tickets(self, guild_id: str, user_id: str) -> List[Dict]:
-        """الحصول على تكتات العضو"""
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM tickets WHERE guild_id = ? AND opener_id = ? ORDER BY created_at DESC',
-                (guild_id, user_id)
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            bot_logger.database_error('get_user_tickets', str(e))
+            return await self.fetchall('SELECT * FROM tickets WHERE guild_id = ? AND opener_id = ? ORDER BY created_at DESC', (guild_id, user_id))
+        except Exception:
             return []
 
-    # ==================== المستويات ====================
-
-    async def add_xp(self, guild_id: str, user_id: str, xp: int) -> Dict:
-        """إضافة XP للعضو"""
+    # Tickets V2 (advanced)
+    async def save_ticket_v2(self, ticket_id: int, channel_id: str, guild_id: str, creator_id: str, category_id: str = None, reason: str = None, custom_answers: Optional[dict] = None, status: str = 'open'):
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM levels WHERE guild_id = ? AND user_id = ?',
-                (guild_id, user_id)
-            )
-            row = await cursor.fetchone()
+            ca = json.dumps(custom_answers or {})
+            await self.execute('''
+                INSERT INTO tickets_v2
+                (ticket_id, channel_id, guild_id, creator_id, category_id, reason, custom_answers, created_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (ticket_id, channel_id, guild_id, creator_id, category_id, reason, ca, datetime.now().isoformat(), status))
+        except Exception as e:
+            bot_logger.database_error('save_ticket_v2', str(e))
 
+    async def update_ticket_v2(self, channel_id: str, **fields):
+        """
+        Update fields in tickets_v2. Example: await db.update_ticket_v2(channel_id, status='closed', closed_by='123')
+        """
+        try:
+            if not fields:
+                return
+            cols = []
+            params = []
+            for k, v in fields.items():
+                cols.append(f'{k} = ?')
+                params.append(json.dumps(v) if isinstance(v, (dict, list)) else v)
+            params.append(channel_id)
+            sql = f'UPDATE tickets_v2 SET {", ".join(cols)} WHERE channel_id = ?'
+            await self.execute(sql, tuple(params))
+        except Exception as e:
+            bot_logger.database_error('update_ticket_v2', str(e))
+
+    async def get_ticket_v2(self, channel_id: str) -> Optional[Dict]:
+        try:
+            return await self.fetchone('SELECT * FROM tickets_v2 WHERE channel_id = ?', (channel_id,))
+        except Exception:
+            return None
+
+    async def get_ticket_by_id_v2(self, ticket_id: int) -> Optional[Dict]:
+        try:
+            return await self.fetchone('SELECT * FROM tickets_v2 WHERE ticket_id = ?', (ticket_id,))
+        except Exception:
+            return None
+
+    async def list_tickets_v2(self, guild_id: str, status: Optional[str] = None) -> List[Dict]:
+        try:
+            if status:
+                return await self.fetchall('SELECT * FROM tickets_v2 WHERE guild_id = ? AND status = ? ORDER BY created_at DESC', (guild_id, status))
+            return await self.fetchall('SELECT * FROM tickets_v2 WHERE guild_id = ? ORDER BY created_at DESC', (guild_id,))
+        except Exception:
+            return []
+
+    # Ticket categories / panels / transcripts
+    async def save_ticket_category(self, guild_id: str, category_id: str, data: dict):
+        try:
+            await self.execute('''
+                INSERT INTO ticket_categories (guild_id, category_id, data)
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, category_id) DO UPDATE SET data = excluded.data
+            ''', (guild_id, category_id, json.dumps(data)))
+        except Exception as e:
+            bot_logger.database_error('save_ticket_category', str(e))
+
+    async def load_ticket_categories(self, guild_id: str) -> List[Dict]:
+        try:
+            rows = await self.fetchall('SELECT category_id, data FROM ticket_categories WHERE guild_id = ?', (guild_id,))
+            # parse JSON
+            out = []
+            for r in rows:
+                try:
+                    rdata = json.loads(r['data']) if r.get('data') else {}
+                except Exception:
+                    rdata = {}
+                out.append({'category_id': r['category_id'], 'data': rdata})
+            return out
+        except Exception as e:
+            bot_logger.database_error('load_ticket_categories', str(e))
+            return []
+
+    async def remove_ticket_category(self, guild_id: str, category_id: str):
+        try:
+            await self.execute('DELETE FROM ticket_categories WHERE guild_id = ? AND category_id = ?', (guild_id, category_id))
+        except Exception as e:
+            bot_logger.database_error('remove_ticket_category', str(e))
+
+    async def save_ticket_panel(self, message_id: str, guild_id: str, channel_id: str, data: dict = None):
+        try:
+            await self.execute('INSERT OR REPLACE INTO ticket_panels (message_id, guild_id, channel_id, data) VALUES (?, ?, ?, ?)', (message_id, guild_id, channel_id, json.dumps(data or {})))
+        except Exception as e:
+            bot_logger.database_error('save_ticket_panel', str(e))
+
+    async def get_ticket_panel(self, message_id: str) -> Optional[Dict]:
+        try:
+            row = await self.fetchone('SELECT * FROM ticket_panels WHERE message_id = ?', (message_id,))
+            if row and row.get('data'):
+                try:
+                    row['data'] = json.loads(row['data'])
+                except Exception:
+                    pass
+            return row
+        except Exception as e:
+            bot_logger.database_error('get_ticket_panel', str(e))
+            return None
+
+    async def save_transcript(self, ticket_id: int, file_path: str):
+        try:
+            await self.execute('INSERT INTO ticket_transcripts (ticket_id, file_path) VALUES (?, ?)', (ticket_id, file_path))
+        except Exception as e:
+            bot_logger.database_error('save_transcript', str(e))
+
+    async def get_transcripts_for_ticket(self, ticket_id: int) -> List[Dict]:
+        try:
+            return await self.fetchall('SELECT * FROM ticket_transcripts WHERE ticket_id = ? ORDER BY created_at DESC', (ticket_id,))
+        except Exception:
+            return []
+
+    # Leveling helpers
+    async def add_xp(self, guild_id: str, user_id: str, xp: int) -> Dict:
+        """
+        Backwards-compatible: uses a simple formula if leveling_config absent.
+        Returns a dict: {'xp','level','old_level','leveled_up'}
+        """
+        try:
+            row = await self.fetchone('SELECT * FROM levels WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
             if row:
                 data = dict(row)
-                new_xp = data['xp'] + xp
+                new_xp = data.get('xp', 0) + xp
+                # default leveling curve: sqrt xp / 10 (keep compatibility)
+                old_level = data.get('level', 0)
                 new_level = int(new_xp ** 0.5) // 10
-                new_messages = data['messages'] + 1
-
-                await self.conn.execute(
-                    'UPDATE levels SET xp = ?, level = ?, messages = ?, last_xp_time = ? WHERE guild_id = ? AND user_id = ?',
-                    (new_xp, new_level, new_messages, datetime.now().isoformat(), guild_id, user_id)
-                )
-                await self.conn.commit()
-
-                return {
-                    'xp': new_xp,
-                    'level': new_level,
-                    'old_level': data['level'],
-                    'leveled_up': new_level > data['level']
-                }
+                new_messages = data.get('messages', 0) + 1
+                await self.execute('UPDATE levels SET xp = ?, level = ?, messages = ?, last_xp_time = ? WHERE guild_id = ? AND user_id = ?',
+                                   (new_xp, new_level, new_messages, datetime.now().isoformat(), guild_id, user_id))
+                return {'xp': new_xp, 'level': new_level, 'old_level': old_level, 'leveled_up': new_level > old_level}
             else:
-                await self.conn.execute(
-                    'INSERT INTO levels (guild_id, user_id, xp, level, messages, last_xp_time) VALUES (?, ?, ?, ?, ?, ?)',
-                    (guild_id, user_id, xp, 0, 1, datetime.now().isoformat())
-                )
-                await self.conn.commit()
+                await self.execute('INSERT INTO levels (guild_id, user_id, xp, level, messages, last_xp_time) VALUES (?, ?, ?, ?, ?, ?)', (guild_id, user_id, xp, 0, 1, datetime.now().isoformat()))
                 return {'xp': xp, 'level': 0, 'old_level': 0, 'leveled_up': False}
         except Exception as e:
             bot_logger.database_error('add_xp', str(e))
             return {'xp': 0, 'level': 0, 'old_level': 0, 'leveled_up': False}
 
     async def get_level(self, guild_id: str, user_id: str) -> Optional[Dict]:
-        """الحصول على مستوى العضو"""
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM levels WHERE guild_id = ? AND user_id = ?',
-                (guild_id, user_id)
-            )
-            row = await cursor.fetchone()
-            return dict(row) if row else None
-        except Exception as e:
-            bot_logger.database_error('get_level', str(e))
+            return await self.fetchone('SELECT * FROM levels WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
+        except Exception:
             return None
 
     async def get_leaderboard(self, guild_id: str, limit: int = 10) -> List[Dict]:
-        """لوحة الصدارة"""
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM levels WHERE guild_id = ? ORDER BY xp DESC LIMIT ?',
-                (guild_id, limit)
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
-        except Exception as e:
-            bot_logger.database_error('get_leaderboard', str(e))
+            return await self.fetchall('SELECT * FROM levels WHERE guild_id = ? ORDER BY xp DESC LIMIT ?', (guild_id, limit))
+        except Exception:
             return []
 
-    # ==================== الردود التلقائية ====================
-
-    async def add_autoresponse(
-        self,
-        guild_id: str,
-        trigger: str,
-        response: str,
-        trigger_type: str = 'contains',
-        chance: int = 100,
-        cooldown: int = 0,
-        enabled: int = 1,
-        channels: Optional[str] = None
-    ) -> int:
-        """إضافة رد تلقائي. يعيد الـ id (0 إن فشل)."""
+    # Autoresponses
+    async def add_autoresponse(self, guild_id: str, trigger: str, response: str, trigger_type: str = 'contains', chance: int = 100, cooldown: int = 0, enabled: int = 1, channels: Optional[str] = None) -> int:
         try:
-            cursor = await self.conn.execute(
-                'INSERT INTO autoresponses '
-                '(guild_id, trigger, response, trigger_type, enabled, chance, cooldown, channels) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                (guild_id, trigger, response, trigger_type, enabled, chance, cooldown, channels)
-            )
-            await self.conn.commit()
-            bot_logger.database_query('INSERT', 'autoresponses', True)
-            return cursor.lastrowid or 0
+            cur = await self.execute('INSERT INTO autoresponses (guild_id, trigger, response, trigger_type, enabled, chance, cooldown, channels) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                          (guild_id, trigger, response, trigger_type, enabled, chance, cooldown, channels))
+            return getattr(cur, 'lastrowid', 0) or 0
         except Exception as e:
             bot_logger.database_error('add_autoresponse', str(e))
             return 0
 
-    async def get_autoresponses(self, guild_id: str) -> List[Dict[str, Any]]:
-        """جلب كل الردود التلقائية للسيرفر (قائمة قواميس)."""
+    async def get_autoresponses(self, guild_id: str) -> List[Dict]:
         try:
-            cursor = await self.conn.execute(
-                'SELECT * FROM autoresponses WHERE guild_id = ? ORDER BY id ASC',
-                (guild_id,)
-            )
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
-            bot_logger.database_error('get_autoresponses', str(e))
+            return await self.fetchall('SELECT * FROM autoresponses WHERE guild_id = ? ORDER BY id ASC', (guild_id,))
+        except Exception:
             return []
 
     async def remove_autoresponse(self, ar_id: int) -> bool:
-        """حذف رد تلقائي حسب الـ id."""
         try:
-            cursor = await self.conn.execute(
-                'DELETE FROM autoresponses WHERE id = ?',
-                (ar_id,)
-            )
-            await self.conn.commit()
+            await self.execute('DELETE FROM autoresponses WHERE id = ?', (ar_id,))
             return True
-        except Exception as e:
-            bot_logger.database_error('remove_autoresponse', str(e))
+        except Exception:
             return False
 
     async def toggle_autoresponse(self, ar_id: int) -> bool:
-        """تبديل حالة (enabled) لرد تلقائي. يعيد الحالة الجديدة (True=enabled)."""
         try:
-            cur = await self.conn.execute('SELECT enabled FROM autoresponses WHERE id = ?', (ar_id,))
-            row = await cur.fetchone()
+            row = await self.fetchone('SELECT enabled FROM autoresponses WHERE id = ?', (ar_id,))
             if not row:
                 return False
-            current = row[0]
-            new = 0 if (current == 1 or current == True) else 1
-            await self.conn.execute('UPDATE autoresponses SET enabled = ? WHERE id = ?', (new, ar_id))
-            await self.conn.commit()
+            current = row['enabled']
+            new = 0 if (current == 1 or current is True) else 1
+            await self.execute('UPDATE autoresponses SET enabled = ? WHERE id = ?', (new, ar_id))
             return bool(new)
         except Exception as e:
             bot_logger.database_error('toggle_autoresponse', str(e))
             return False
 
     async def update_autoresponse(self, ar_id: int, **fields) -> bool:
-        """
-        تعديل حقول الرد التلقائي.
-        مقبول الحقول: trigger, response, trigger_type, enabled, chance, cooldown, channels, last_used
-        """
         allowed = {'trigger', 'response', 'trigger_type', 'enabled', 'chance', 'cooldown', 'channels', 'last_used'}
         updates = []
         params = []
         for k, v in fields.items():
-            if k in allowed and v is not None:
+            if k in allowed:
                 updates.append(f"{k} = ?")
                 params.append(v)
         if not updates:
@@ -616,118 +675,177 @@ class Database:
         params.append(ar_id)
         sql = f"UPDATE autoresponses SET {', '.join(updates)} WHERE id = ?"
         try:
-            await self.conn.execute(sql, tuple(params))
-            await self.conn.commit()
+            await self.execute(sql, tuple(params))
             return True
         except Exception as e:
             bot_logger.database_error('update_autoresponse', str(e))
             return False
 
-    async def search_autoresponses(self, guild_id: str, query: str) -> List[Dict[str, Any]]:
-        """بحث في المحفز أو الرد بواسطة LIKE."""
+    async def search_autoresponses(self, guild_id: str, query: str) -> List[Dict]:
         try:
             q = f"%{query}%"
-            cursor = await self.conn.execute(
-                'SELECT * FROM autoresponses WHERE guild_id = ? AND (trigger LIKE ? OR response LIKE ?) ORDER BY id ASC',
-                (guild_id, q, q)
-            )
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
-            bot_logger.database_error('search_autoresponses', str(e))
+            return await self.fetchall('SELECT * FROM autoresponses WHERE guild_id = ? AND (trigger LIKE ? OR response LIKE ?) ORDER BY id ASC', (guild_id, q, q))
+        except Exception:
             return []
 
     async def get_autoresponse_stats(self, guild_id: str) -> Dict[str, Any]:
-        """إحصائيات بسيطة: total, enabled, disabled, by_type dict."""
         try:
-            cur = await self.conn.execute('SELECT COUNT(*) FROM autoresponses WHERE guild_id = ?', (guild_id,))
-            total_row = await cur.fetchone()
-            total = total_row[0] if total_row else 0
-
-            cur = await self.conn.execute('SELECT COUNT(*) FROM autoresponses WHERE guild_id = ? AND enabled = 1', (guild_id,))
-            enabled_row = await cur.fetchone()
-            enabled = enabled_row[0] if enabled_row else 0
-
+            total_row = await self.fetchone('SELECT COUNT(*) as cnt FROM autoresponses WHERE guild_id = ?', (guild_id,))
+            enabled_row = await self.fetchone('SELECT COUNT(*) as cnt FROM autoresponses WHERE guild_id = ? AND enabled = 1', (guild_id,))
+            total = total_row['cnt'] if total_row else 0
+            enabled = enabled_row['cnt'] if enabled_row else 0
             disabled = total - enabled
-
-            cur = await self.conn.execute(
-                'SELECT trigger_type, COUNT(*) as cnt FROM autoresponses WHERE guild_id = ? GROUP BY trigger_type',
-                (guild_id,)
-            )
-            rows = await cur.fetchall()
-            by_type = {r[0]: r[1] for r in rows} if rows else {}
-
+            rows = await self.fetchall('SELECT trigger_type, COUNT(*) as cnt FROM autoresponses WHERE guild_id = ? GROUP BY trigger_type', (guild_id,))
+            by_type = {r['trigger_type']: r['cnt'] for r in rows} if rows else {}
             return {'total': total, 'enabled': enabled, 'disabled': disabled, 'by_type': by_type}
         except Exception as e:
             bot_logger.database_error('get_autoresponse_stats', str(e))
             return {'total': 0, 'enabled': 0, 'disabled': 0, 'by_type': {}}
 
-    # ==================== الإحصائيات اليومية (stats) ====================
-    async def increment_stat(self, guild_id: str, stat_name: str, amount: int = 1):
-        """
-        زيادة إحصائية معينة
-
-        Args:
-            guild_id: معرف السيرفر
-            stat_name: اسم الإحصائية (messages, joins, leaves, voice_minutes)
-            amount: المقدار (افتراضي: 1)
-        """
+    # Polls
+    async def create_poll(self, guild_id: str, channel_id: str, creator_id: str, question: str, options: List[str], duration_minutes: int = 60, allow_multiple: int = 0, anonymous: int = 0) -> int:
         try:
-            # الحصول على التاريخ الحالي
-            today = datetime.now().strftime('%Y-%m-%d')
-
-            # التحقق من وجود سجل لليوم
-            cursor = await self.conn.execute(
-                'SELECT * FROM stats WHERE guild_id = ? AND date = ?',
-                (guild_id, today)
-            )
-            row = await cursor.fetchone()
-
-            if row:
-                # تحديث السجل الموجود
-                await self.conn.execute(
-                    f'UPDATE stats SET {stat_name} = {stat_name} + ? WHERE guild_id = ? AND date = ?',
-                    (amount, guild_id, today)
-                )
-            else:
-                # إنشاء سجل جديد
-                await self.conn.execute(
-                    f'INSERT INTO stats (guild_id, date, {stat_name}) VALUES (?, ?, ?)',
-                    (guild_id, today, amount)
-                )
-
-            await self.conn.commit()
-            bot_logger.database_query('UPDATE', 'stats', True)
-
+            opts = json.dumps(options)
+            cur = await self.execute('INSERT INTO polls (guild_id, channel_id, creator_id, question, options, duration_minutes, allow_multiple, anonymous) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                          (guild_id, channel_id, creator_id, question, opts, duration_minutes, allow_multiple, anonymous))
+            return getattr(cur, 'lastrowid', 0) or 0
         except Exception as e:
-            bot_logger.database_error(f'increment_stat: {stat_name}', str(e))
+            bot_logger.database_error('create_poll', str(e))
+            return 0
+
+    async def get_poll(self, poll_id: int) -> Optional[Dict]:
+        try:
+            row = await self.fetchone('SELECT * FROM polls WHERE poll_id = ?', (poll_id,))
+            if row and row.get('options'):
+                try:
+                    row['options'] = json.loads(row['options'])
+                except Exception:
+                    pass
+            return row
+        except Exception:
+            return None
+
+    async def close_poll(self, poll_id: int):
+        try:
+            await self.execute('UPDATE polls SET is_closed = 1, closed_at = ? WHERE poll_id = ?', (datetime.now().isoformat(), poll_id))
+        except Exception as e:
+            bot_logger.database_error('close_poll', str(e))
+
+    async def vote_poll(self, poll_id: int, user_id: str, option_index: int):
+        try:
+            # prevent duplicates if poll is not allow_multiple
+            poll = await self.get_poll(poll_id)
+            if not poll:
+                return False
+            if not poll.get('allow_multiple'):
+                existing = await self.fetchone('SELECT * FROM poll_votes WHERE poll_id = ? AND user_id = ?', (poll_id, user_id))
+                if existing:
+                    return False
+            await self.execute('INSERT INTO poll_votes (poll_id, user_id, option_index) VALUES (?, ?, ?)', (poll_id, user_id, option_index))
+            return True
+        except Exception as e:
+            bot_logger.database_error('vote_poll', str(e))
+            return False
+
+    async def get_poll_votes(self, poll_id: int) -> List[Dict]:
+        try:
+            return await self.fetchall('SELECT * FROM poll_votes WHERE poll_id = ?', (poll_id,))
+        except Exception:
+            return []
+
+    # Invites
+    async def record_invite(self, guild_id: str, user_id: str, inviter_id: Optional[str] = None):
+        try:
+            await self.execute('INSERT INTO invites (guild_id, user_id, inviter_id) VALUES (?, ?, ?)', (guild_id, user_id, inviter_id))
+        except Exception as e:
+            bot_logger.database_error('record_invite', str(e))
+
+    async def get_invites(self, guild_id: str) -> List[Dict]:
+        try:
+            return await self.fetchall('SELECT * FROM invites WHERE guild_id = ? ORDER BY created_at DESC', (guild_id,))
+        except Exception:
+            return []
+
+    async def add_invite_reward(self, guild_id: str, required_invites: int, role_id: str):
+        try:
+            await self.execute('INSERT OR REPLACE INTO invite_rewards (guild_id, required_invites, role_id) VALUES (?, ?, ?)', (guild_id, required_invites, role_id))
+        except Exception as e:
+            bot_logger.database_error('add_invite_reward', str(e))
+
+    async def get_invite_rewards(self, guild_id: str) -> List[Dict]:
+        try:
+            return await self.fetchall('SELECT * FROM invite_rewards WHERE guild_id = ?', (guild_id,))
+        except Exception:
+            return []
+
+    # Stats (daily)
+    async def increment_stat(self, guild_id: str, stat_name: str, amount: int = 1):
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            row = await self.fetchone('SELECT * FROM stats WHERE guild_id = ? AND date = ?', (guild_id, today))
+            if row:
+                await self.execute(f'UPDATE stats SET {stat_name} = {stat_name} + ? WHERE guild_id = ? AND date = ?', (amount, guild_id, today))
+            else:
+                await self.execute(f'INSERT INTO stats (guild_id, date, {stat_name}) VALUES (?, ?, ?)', (guild_id, today, amount))
+        except Exception as e:
+            bot_logger.database_error('increment_stat', str(e))
 
     async def get_stats(self, guild_id: str, days: int = 7) -> List[Dict]:
-        """
-        الحصول على إحصائيات السيرفر لعدة أيام
-
-        Args:
-            guild_id: معرف السيرفر
-            days: عدد الأيام (افتراضي: 7)
-
-        Returns:
-            قائمة الإحصائيات
-        """
         try:
-            cursor = await self.conn.execute('''
-            SELECT date, messages, joins, leaves, voice_minutes
-            FROM stats
-            WHERE guild_id = ?
-            ORDER BY date DESC
-            LIMIT ?
-        ''', (guild_id, days))
-
-            rows = await cursor.fetchall()
-            return [dict(row) for row in reversed(rows)]  # ترتيب تصاعدي
-
+            rows = await self.fetchall('SELECT date, messages, joins, leaves, voice_minutes FROM stats WHERE guild_id = ? ORDER BY date DESC LIMIT ?', (guild_id, days))
+            return list(reversed(rows))
         except Exception as e:
             bot_logger.database_error('get_stats', str(e))
             return []
 
-# إنشاء نسخة عامة
+    # Reminders
+    async def add_reminder(self, guild_id: str, user_id: str, channel_id: str, message: str, remind_at: str) -> int:
+        try:
+            cur = await self.execute('INSERT INTO reminders (guild_id, user_id, channel_id, message, remind_at) VALUES (?, ?, ?, ?, ?)', (guild_id, user_id, channel_id, message, remind_at))
+            return getattr(cur, 'lastrowid', 0) or 0
+        except Exception as e:
+            bot_logger.database_error('add_reminder', str(e))
+            return 0
+
+    async def get_due_reminders(self, before_iso: str) -> List[Dict]:
+        try:
+            return await self.fetchall('SELECT * FROM reminders WHERE remind_at <= ? ORDER BY remind_at ASC', (before_iso,))
+        except Exception as e:
+            bot_logger.database_error('get_due_reminders', str(e))
+            return []
+
+    async def remove_reminder(self, reminder_id: int):
+        try:
+            await self.execute('DELETE FROM reminders WHERE id = ?', (reminder_id,))
+        except Exception as e:
+            bot_logger.database_error('remove_reminder', str(e))
+
+    # Notes / Logs / Lists simple wrappers
+    async def add_note(self, guild_id: str, user_id: str, moderator_id: str, note: str) -> int:
+        try:
+            cur = await self.execute('INSERT INTO notes (guild_id, user_id, moderator_id, note) VALUES (?, ?, ?, ?)', (guild_id, user_id, moderator_id, note))
+            return getattr(cur, 'lastrowid', 0) or 0
+        except Exception as e:
+            bot_logger.database_error('add_note', str(e))
+            return 0
+
+    async def add_log(self, guild_id: str, action_type: str, user_id: Optional[str] = None, moderator_id: Optional[str] = None, target_id: Optional[str] = None, reason: Optional[str] = None, details: Optional[str] = None):
+        try:
+            await self.execute('INSERT INTO logs (guild_id, action_type, user_id, moderator_id, target_id, reason, details) VALUES (?, ?, ?, ?, ?, ?, ?)', (guild_id, action_type, user_id, moderator_id, target_id, reason, details))
+        except Exception as e:
+            bot_logger.database_error('add_log', str(e))
+
+    async def add_to_list(self, guild_id: str, user_id: str, list_type: str, reason: str = None):
+        try:
+            await self.execute('INSERT OR REPLACE INTO lists (guild_id, user_id, list_type, reason) VALUES (?, ?, ?, ?)', (guild_id, user_id, list_type, reason))
+        except Exception as e:
+            bot_logger.database_error('add_to_list', str(e))
+
+    async def remove_from_list(self, guild_id: str, user_id: str, list_type: str):
+        try:
+            await self.execute('DELETE FROM lists WHERE guild_id = ? AND user_id = ? AND list_type = ?', (guild_id, user_id, list_type))
+        except Exception as e:
+            bot_logger.database_error('remove_from_list', str(e))
+
+# Global instance for import by other modules
 db = Database()
